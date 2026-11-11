@@ -1,3 +1,4 @@
+import os
 import zlib
 from typing import Any
 
@@ -271,7 +272,8 @@ def setup_periodic_tasks(sender: Celery, **kwargs: Any) -> None:
         sender.add_periodic_task(30.0, process_ai_training_privacy_requests.s(), name="process-ai-training-privacy")
     # Short-interval heartbeat tasks (<60s) use intervals since cron minimum is 1 minute.
     # These are fine because they run more frequently than beat restarts.
-    if not settings.DEBUG:
+    go_maintenance = os.getenv("POSTHOG_GO_MAINTENANCE", "0") == "1"
+    if not settings.DEBUG and not go_maintenance:
         sender.add_periodic_task(10, redis_celery_queue_depth.s(), name="10 sec queue probe")
 
     sender.add_periodic_task(
@@ -287,7 +289,8 @@ def setup_periodic_tasks(sender: Celery, **kwargs: Any) -> None:
         name="reconcile wizard runs",
     )
 
-    sender.add_periodic_task(10, redis_heartbeat.s(), name="10 sec heartbeat")
+    if not go_maintenance:
+        sender.add_periodic_task(10, redis_heartbeat.s(), name="10 sec heartbeat")
     sender.add_periodic_task(
         QueryStatusManager.POLL_INTERVAL_SECONDS,
         start_poll_query_performance.s(),

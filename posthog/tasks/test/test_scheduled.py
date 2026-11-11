@@ -1,4 +1,6 @@
-from unittest.mock import MagicMock
+import os
+
+from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, TestCase
 
@@ -18,6 +20,19 @@ class TestScheduledTasks(TestCase):
             setup_periodic_tasks(app)
         except Exception as exc:
             assert exc is None, exc
+
+
+class TestGoMaintenanceScheduling(SimpleTestCase):
+    @parameterized.expand([(False, False), (True, False), (False, True), (True, True)])
+    def test_maintenance_has_one_owner(self, enabled: bool, debug: bool) -> None:
+        sender = MagicMock()
+        with patch.dict(os.environ, {"POSTHOG_GO_MAINTENANCE": "1" if enabled else "0"}):
+            with self.settings(DEBUG=debug):
+                setup_periodic_tasks(sender)
+        names = [call.kwargs.get("name") for call in sender.add_periodic_task.call_args_list]
+        assert ("10 sec heartbeat" in names) == (not enabled)
+        assert ("10 sec queue probe" in names) == (not enabled and not debug)
+        assert "query performance heartbeat" in names
 
 
 class TestPrivacyTaskScheduling(SimpleTestCase):
