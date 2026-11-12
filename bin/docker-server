@@ -19,6 +19,8 @@ if [ "${POSTHOG_LOW_MEMORY_WEB:-0}" = "1" ]; then
     export GRANIAN_INTERFACE=asgi
     export GRANIAN_WORKERS=${GRANIAN_WORKERS:-1}
     export GRANIAN_BACKPRESSURE=${GRANIAN_BACKPRESSURE:-8}
+    # Idle proxy connections consume admission slots after their requests finish.
+    export GRANIAN_HTTP1_KEEP_ALIVE=${GRANIAN_HTTP1_KEEP_ALIVE:-false}
 fi
 
 # asgi serves posthog.asgi:application, wsgi serves posthog.wsgi:application

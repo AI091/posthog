@@ -16,9 +16,12 @@ both default-off switches. Pass the desired environment variables into the
 containers explicitly, for example in a Compose environment override.
 
 The profile sets `GRANIAN_INTERFACE=asgi`, defaults `GRANIAN_WORKERS` to `1`
-and defaults `GRANIAN_BACKPRESSURE` to `8`. Explicit worker and backpressure
-values take precedence. Remove any existing `GRANIAN_WORKERS` override to use
-the single-process default. `GRANIAN_BLOCKING_THREADS` controls WSGI, not the
+and defaults `GRANIAN_BACKPRESSURE` to `8`. HTTP/1 keep-alive defaults off so idle
+proxy connections cannot occupy the limited admission slots and block new requests.
+`GRANIAN_HTTP1_KEEP_ALIVE` remains available as an explicit override.
+Explicit worker and backpressure values take precedence.
+Remove any existing `GRANIAN_WORKERS` override to use the single-process default.
+`GRANIAN_BLOCKING_THREADS` controls WSGI, not the
 ASGI request threads; it is not needed for this profile. Each concurrent
 request can hold its own database connection until request completion.
 

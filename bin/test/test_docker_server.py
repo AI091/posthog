@@ -14,14 +14,35 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "docker-server"
 class TestDockerServer(unittest.TestCase):
     @parameterized.expand(
         [
-            ({}, {"interface": "asgi", "workers": "4", "backpressure": None, "target": "posthog.asgi:application"}),
+            (
+                {},
+                {
+                    "interface": "asgi",
+                    "workers": "4",
+                    "backpressure": None,
+                    "keep_alive": None,
+                    "target": "posthog.asgi:application",
+                },
+            ),
             (
                 {"GRANIAN_INTERFACE": "wsgi", "GRANIAN_WORKERS": "3", "GRANIAN_BLOCKING_THREADS": "8"},
-                {"interface": "wsgi", "workers": "3", "backpressure": None, "target": "posthog.wsgi:application"},
+                {
+                    "interface": "wsgi",
+                    "workers": "3",
+                    "backpressure": None,
+                    "keep_alive": None,
+                    "target": "posthog.wsgi:application",
+                },
             ),
             (
                 {"POSTHOG_LOW_MEMORY_WEB": "1"},
-                {"interface": "asgi", "workers": "1", "backpressure": "8", "target": "posthog.asgi:application"},
+                {
+                    "interface": "asgi",
+                    "workers": "1",
+                    "backpressure": "8",
+                    "keep_alive": "false",
+                    "target": "posthog.asgi:application",
+                },
             ),
             (
                 {
@@ -29,8 +50,15 @@ class TestDockerServer(unittest.TestCase):
                     "GRANIAN_INTERFACE": "wsgi",
                     "GRANIAN_WORKERS": "2",
                     "GRANIAN_BACKPRESSURE": "16",
+                    "GRANIAN_HTTP1_KEEP_ALIVE": "true",
                 },
-                {"interface": "asgi", "workers": "2", "backpressure": "16", "target": "posthog.asgi:application"},
+                {
+                    "interface": "asgi",
+                    "workers": "2",
+                    "backpressure": "16",
+                    "keep_alive": "true",
+                    "target": "posthog.asgi:application",
+                },
             ),
         ]
     )
@@ -50,6 +78,7 @@ print(json.dumps({
     "interface": os.getenv("GRANIAN_INTERFACE"),
     "workers": os.getenv("GRANIAN_WORKERS"),
     "backpressure": os.getenv("GRANIAN_BACKPRESSURE"),
+    "keep_alive": os.getenv("GRANIAN_HTTP1_KEEP_ALIVE"),
     "target": sys.argv[-1],
 }))
 """,
