@@ -1,12 +1,16 @@
 import os
+import ast
 import sys
 import copy
 import json
+import inspect
 from typing import Any
+from urllib.parse import quote, urlencode
 
 from unittest.mock import patch
 
 import django
+from django.conf import settings
 
 from celery import Celery
 from celery.beat import Scheduler
@@ -99,13 +103,107 @@ def export_schedule(app: Celery) -> dict[str, Any]:
                     ),
                 }
             )
+    housekeeping = (
+        export_housekeeping()
+        if os.getenv("POSTHOG_GO_SCHEDULER") == "1" and os.getenv("POSTHOG_GO_HOUSEKEEPING") == "1"
+        else None
+    )
     return {
-        "version": 1,
+        "version": 2 if housekeeping else 1,
         "prefix": config.key_prefix,
         "lock_key": config.lock_key,
         "lock_seconds": config.lock_timeout or 45,
         "entries": entries,
+        "housekeeping": housekeeping,
     }
+
+
+def export_housekeeping() -> dict[str, Any]:
+    from posthog.celery_queues import CeleryQueue  # noqa: PLC0415 - Django must be initialized first
+    from posthog.clickhouse.client.connection import ClickHouseUser, get_clickhouse_creds  # noqa: PLC0415
+    from posthog.clickhouse.client.execute_async import QueryStatusManager  # noqa: PLC0415
+    from posthog.tasks.poll_query_performance import get_query_results  # noqa: PLC0415
+    from posthog.tasks.tasks import (  # noqa: PLC0415
+        Polling,
+        pg_plugin_server_query_timing,
+        pg_table_cache_hit_rate,
+        redis_celery_queue_depth,
+        redis_heartbeat,
+        start_poll_query_performance,
+    )
+
+    credentials = get_clickhouse_creds(ClickHouseUser.OPS)
+    database = settings.DATABASES["default"]
+    if database["ENGINE"] != "django.db.backends.postgresql":
+        raise ValueError("Go housekeeping requires the standard PostgreSQL backend")
+    options = database.get("OPTIONS", {})
+    supported = {
+        "sslmode",
+        "sslcert",
+        "sslkey",
+        "sslrootcert",
+        "sslcrl",
+        "application_name",
+        "connect_timeout",
+        "options",
+    }
+    if any(key not in supported and value is not None and value is not False for key, value in options.items()):
+        raise ValueError("unsupported PostgreSQL connection options")
+    parameters = {
+        "host": database["HOST"],
+        "port": database["PORT"] or "5432",
+        "user": database["USER"],
+        "password": database["PASSWORD"],
+        **{key: value for key, value in options.items() if key in supported and value is not None},
+    }
+    postgres_url = "postgresql:///" + quote(database["NAME"], safe="") + "?" + urlencode(parameters)
+    handlers = {
+        redis_heartbeat.name: "heartbeat",
+        redis_celery_queue_depth.name: "queue_depth",
+        pg_table_cache_hit_rate.name: "pg_cache",
+        pg_plugin_server_query_timing.name: "pg_timing",
+        start_poll_query_performance.name: "query_watchdog",
+    }
+    return {
+        "handlers": handlers,
+        "queues": [queue.value for queue in CeleryQueue],
+        "gateway": settings.PROM_PUSHGATEWAY_ADDRESS or "",
+        "postgres_url": postgres_url,
+        "pg_cache_sql": extract_maintenance_sql(pg_table_cache_hit_rate.run),
+        "pg_timing_sql": extract_maintenance_sql(pg_plugin_server_query_timing.run),
+        "statsd_host": settings.STATSD_HOST or "",
+        "statsd_port": int(settings.STATSD_PORT),
+        "statsd_prefix": settings.STATSD_PREFIX,
+        "statsd_separator": settings.STATSD_SEPARATOR,
+        "clickhouse": {
+            "url": settings.CLICKHOUSE_HTTP_URL,
+            "database": settings.CLICKHOUSE_DATABASE,
+            "user": credentials.user,
+            "password": credentials.password,
+            "password_file": credentials.password_file or "",
+            "ca": settings.CLICKHOUSE_CA or "",
+            "verify": settings.CLICKHOUSE_VERIFY,
+            "cluster": settings.CLICKHOUSE_CLUSTER,
+            "sql": extract_maintenance_sql(get_query_results).replace("%(cluster)s", "{cluster:String}"),
+        },
+        "progress_prefix": QueryStatusManager.KEY_PREFIX_ASYNC_RESULTS,
+        "progress_ttl": QueryStatusManager.STATUS_TTL_SECONDS,
+        "heartbeat_ttl": QueryStatusManager.HEARTBEAT_TTL_SECONDS,
+        "poll_seconds": Polling.TIME_BETWEEN_RUNS_SECONDS,
+        "singleton_key": Polling._SINGLETON_REDIS_KEY,
+    }
+
+
+def extract_maintenance_sql(function: Any) -> str:
+    tree = ast.parse(inspect.getsource(function))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "SYSTEM_PROCESSES_SQL" for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "execute":
+            return ast.literal_eval(node.args[0])
+    raise ValueError("maintenance SQL must remain a literal")
 
 
 def main() -> None:
@@ -124,7 +222,9 @@ def main() -> None:
     app.conf.beat_schedule = {}
     setup_periodic_tasks(app)
     exported = export_schedule(app)
-    with open(sys.argv[1], "w") as output:
+    descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(descriptor, 0o600)
+    with os.fdopen(descriptor, "w") as output:
         json.dump(exported, output)
 
 

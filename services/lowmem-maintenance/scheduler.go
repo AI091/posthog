@@ -34,11 +34,13 @@ type scheduledTask struct {
 }
 
 type schedulerConfig struct {
-	Version     int             `json:"version"`
-	Prefix      string          `json:"prefix"`
-	LockKey     string          `json:"lock_key"`
-	LockSeconds int             `json:"lock_seconds"`
-	Entries     []scheduledTask `json:"entries"`
+	Version      int                 `json:"version"`
+	Prefix       string              `json:"prefix"`
+	LockKey      string              `json:"lock_key"`
+	LockSeconds  int                 `json:"lock_seconds"`
+	Entries      []scheduledTask     `json:"entries"`
+	Housekeeping *housekeepingConfig `json:"housekeeping"`
+	native       *housekeeping
 }
 
 type beatDatetime struct {
@@ -182,6 +184,14 @@ redis.call('ZADD', KEYS[4], ARGV[5], KEYS[2])
 return 1
 `)
 
+var reserveNativeTask = redis.NewScript(`
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -1 end
+if redis.call('HGET', KEYS[2], 'meta') ~= ARGV[2] then return 0 end
+redis.call('HSET', KEYS[2], 'meta', ARGV[3])
+redis.call('ZADD', KEYS[3], ARGV[4], KEYS[2])
+return 1
+`)
+
 func (c schedulerConfig) reconcile(ctx context.Context, client *redis.Client, token string, now time.Time) error {
 	names := make(map[string]bool, len(c.Entries))
 	for _, task := range c.Entries {
@@ -252,16 +262,28 @@ func (c schedulerConfig) tick(ctx context.Context, client *redis.Client, token s
 		if !due {
 			continue
 		}
-		message, err := task.messageAt(now)
-		if err != nil {
-			return 0, err
-		}
 		next, err := task.Schedule.next(now)
 		if err != nil {
 			return 0, err
 		}
 		if next.Sub(now) < delay {
 			delay = next.Sub(now)
+		}
+		if c.native != nil {
+			if kind := c.native.taskKind(task); kind != "" {
+				result, err := reserveNativeTask.Run(ctx, client, []string{c.LockKey, c.Prefix + task.Name, c.Prefix + ":schedule"}, token, meta[i].Val(), newMeta(now, state.Count+1), next.Unix()).Int()
+				if err != nil || result < 0 {
+					return 0, errors.New("native task reservation failed")
+				}
+				if result == 1 {
+					c.native.execute(kind)
+				}
+				continue
+			}
+		}
+		message, err := task.messageAt(now)
+		if err != nil {
+			return 0, err
 		}
 		result, err := dispatchTask.Run(ctx, client, []string{c.LockKey, c.Prefix + task.Name, task.Queue, c.Prefix + ":schedule"}, token, meta[i].Val(), string(message), newMeta(now, state.Count+1), next.Unix()).Int()
 		if err != nil || result < 0 {
@@ -277,8 +299,11 @@ func runScheduler(ctx context.Context, client *redis.Client, path string) error 
 		return errors.New("cannot read exported schedule")
 	}
 	var config schedulerConfig
-	if err := json.Unmarshal(data, &config); err != nil || config.Version != 1 || config.LockKey == "" || config.Prefix == "" || config.LockSeconds < 5 || len(config.Entries) == 0 {
+	if err := json.Unmarshal(data, &config); err != nil || (config.Version != 1 && config.Version != 2) || config.LockKey == "" || config.Prefix == "" || config.LockSeconds < 5 || len(config.Entries) == 0 {
 		return errors.New("invalid exported schedule")
+	}
+	if (config.Version == 2) != (config.Housekeeping != nil) {
+		return errors.New("invalid housekeeping schedule version")
 	}
 	for _, task := range config.Entries {
 		if task.Name == "" || task.Queue == "" || !json.Valid(task.Message) || !json.Valid([]byte(task.Definition)) {
@@ -293,8 +318,17 @@ func runScheduler(ctx context.Context, client *redis.Client, path string) error 
 		return err
 	}
 	token := fmt.Sprintf("%x", tokenBytes)
+	if config.Housekeeping != nil {
+		config.native, err = newHousekeeping(ctx, client, *config.Housekeeping, config.LockKey, token)
+		if err != nil {
+			return err
+		}
+	}
 	leader := false
 	defer func() {
+		if config.native != nil {
+			config.native.close()
+		}
 		cleanup, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		releaseLease.Run(cleanup, client, []string{config.LockKey}, token)

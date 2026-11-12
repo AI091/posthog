@@ -10,3 +10,4 @@ COPY --from=build /scheduler /usr/local/bin/posthog-go-maintenance
 COPY services/lowmem-maintenance/export_schedule.py /code/services/lowmem-maintenance/export_schedule.py
 COPY bin/docker-worker-beat /code/bin/docker-worker-beat
 COPY posthog/tasks/scheduled.py /code/posthog/tasks/scheduled.py
+COPY posthog/tasks/tasks.py /code/posthog/tasks/tasks.py

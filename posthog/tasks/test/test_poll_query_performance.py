@@ -1,3 +1,5 @@
+import os
+
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase
@@ -6,6 +8,28 @@ import posthog.tasks.tasks
 from posthog.redis import get_client
 from posthog.tasks.poll_query_performance import poll_query_performance, query_manager_from_initial_query_id
 from posthog.tasks.tasks import Polling
+
+
+class TestGoHousekeepingOwnership(SimpleTestCase):
+    def test_poll_chain_requires_both_go_flags(self) -> None:
+        for scheduler, housekeeping in (("0", "0"), ("0", "1"), ("1", "0"), ("1", "1")):
+            with self.subTest(scheduler=scheduler, housekeeping=housekeeping):
+                with patch.dict(os.environ, {"POSTHOG_GO_SCHEDULER": scheduler, "POSTHOG_GO_HOUSEKEEPING": housekeeping}):
+                    with patch("posthog.tasks.tasks.get_client") as get_client:
+                        get_client.return_value.get.return_value = Polling._encode_redis_key(0)
+                        with (
+                            patch("posthog.tasks.tasks.poll_query_performance.delay") as delay,
+                            patch("posthog.tasks.tasks.poll_query_performance.apply_async") as apply,
+                            patch("posthog.tasks.poll_query_performance.poll_query_performance") as poll,
+                            patch("posthog.tasks.tasks.logger"),
+                        ):
+                            posthog.tasks.tasks.start_poll_query_performance.run()
+                            posthog.tasks.tasks.poll_query_performance.run(0)
+                        native = scheduler == "1" and housekeeping == "1"
+                        assert get_client.called == (not native)
+                        assert delay.called == (not native)
+                        assert apply.called == (not native)
+                        assert poll.called == (not native)
 
 
 class TestPollQueryPerformance(SimpleTestCase):

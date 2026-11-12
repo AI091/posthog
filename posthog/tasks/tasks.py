@@ -1,3 +1,4 @@
+import os
 import time
 import datetime
 from collections.abc import Callable
@@ -958,6 +959,8 @@ class Polling:
     time_limit=Polling.HARD_TIME_LIMIT_SECONDS,
 )
 def poll_query_performance(last_known_run_time_ns: int) -> None:
+    if os.getenv("POSTHOG_GO_SCHEDULER") == "1" and os.getenv("POSTHOG_GO_HOUSEKEEPING") == "1":
+        return
     start_time_ns = time.time_ns()
 
     try:
@@ -986,6 +989,8 @@ def poll_query_performance(last_known_run_time_ns: int) -> None:
 
 @shared_task(ignore_result=True, max_retries=1)
 def start_poll_query_performance() -> None:
+    if os.getenv("POSTHOG_GO_SCHEDULER") == "1" and os.getenv("POSTHOG_GO_HOUSEKEEPING") == "1":
+        return
     redis_client = get_client()
     last_run_start_time_ns = Polling.get_last_run_time(redis_client)
     now_ns: int = time.time_ns()

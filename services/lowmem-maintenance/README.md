@@ -13,7 +13,7 @@ Use this image for the worker with its usual `--with-scheduler` command. A
 short-lived Python initialization imports Django, rebuilds the effective beat
 schedule (failing on initialization errors), and captures Celery's serialized
 messages and routing. Python exits before Go starts scheduling. The existing
-Python workers execute every periodic task, including heartbeat and queue depth.
+Python workers execute every periodic task unless native housekeeping is also enabled.
 Do not run the standalone maintenance service alongside scheduler mode.
 
 Go supports positive intervals and Celery cron schedules in UTC, including
@@ -43,7 +43,8 @@ rounding, cron starting deadlines, non-JSON serializers, non-v2 task protocols,
 custom broker transport/TLS options, sent-event publication, separate broker/scheduler Redis databases,
 and dynamic RedBeat entries. Keep Python beat for those configurations.
 The generated schedule is a local runtime artifact and can contain configured
-task arguments; protect it like the worker configuration.
+task arguments; with native housekeeping it also contains connection credentials.
+The exporter creates it with mode 0600. Protect it like the worker configuration.
 
 ### Schedule and message parity
 
@@ -96,6 +97,106 @@ Python scheduler (about 1,045 MiB PSS) and adding the small Go scheduler. Python
 consumer concurrency and API workers were retained. The fixture used the same
 configuration and data shape for both modes, including composite person indexes
 on `(team_id, uuid)` and `(team_id, id)` required by the ingestion upsert.
+
+## Native housekeeping (experimental)
+
+Set both `POSTHOG_GO_SCHEDULER=1` and `POSTHOG_GO_HOUSEKEEPING=1` on the
+worker using the scheduler image. Both switches default off. Go then runs:
+
+- Redis heartbeat and Celery queue-depth observations.
+- PostgreSQL cache-hit and plugin query-timing metrics.
+- ClickHouse query-progress observations every two seconds.
+
+The remaining schedules still publish their original Celery messages. The SQL
+is extracted from the Python maintenance functions at startup, and credentials,
+queue names, metric configuration and Redis key constants come from Django.
+Progress polling only reads the system process/query logs; analytics query
+execution remains in Python. Rotating ClickHouse credentials are read on every
+request with the same static-password fallback and JWT expiry leeway.
+
+Go merges progress into the existing per-query Redis dictionaries, preserves
+unrecognized fields, and refreshes the existing status and heartbeat TTLs.
+Progress writes are fenced by the scheduler lease. An already queued Python
+poll-chain job drains without rescheduling when both switches are enabled.
+Metrics run separately from scheduling and progress polling, with one bounded
+operation per metric kind. The legacy SQL and its compatibility limitations
+are retained, including best-effort handling of unsupported PostgreSQL statistics.
+
+To return housekeeping to Python, unset `POSTHOG_GO_HOUSEKEEPING` and restart
+the worker. Its watchdog restarts the Python poll chain; the shared singleton
+timestamp prevents an overlapping old chain. To restore beat too, unset
+`POSTHOG_GO_SCHEDULER`. Do not erase Redis state. Configure Python consumer
+concurrency separately with the existing `WEB_CONCURRENCY` setting; neither
+switch changes the upstream concurrency default.
+
+### Housekeeping contract tests
+
+Use isolated Redis (database 15 is used by the contract producer) and PostgreSQL
+instances. The PostgreSQL test creates only connection-local temporary tables.
+It runs the original SQL over fixture rows and compares real UDP and HTTP
+metric output with Python. The progress test compares Python-generated values,
+merging, integer conversion and TTLs; it also covers credential rotation and
+loss of leadership during an in-flight HTTP request.
+
+```sh
+export HOUSEKEEPING_PARITY_FILE="${TMPDIR:?set TMPDIR to a scratch directory}/housekeeping.json"
+python -m unittest discover -s services/lowmem-maintenance -p test_housekeeping.py
+export LOWMEM_TEST_POSTGRES_URL="postgresql://localhost/isolated_test_database"
+cd services/lowmem-maintenance
+go test -race ./...
+go vet ./...
+```
+
+Keep `CELERY_PARITY_FILE` set too to run the complete schedule/message corpus.
+Run `posthog/tasks/test/test_scheduled.py` and
+`posthog/tasks/test/test_poll_query_performance.py` in the matching Python
+test environment. The flag matrix proves that unsetting either switch keeps
+the Python poll-chain implementation available.
+
+### Worker concurrency measurement
+
+Five alternating hobby-stack runs compared upstream beat with eight Celery
+children against Go scheduling/housekeeping with one child. Both used three
+API workers, identical images for the other services and the fixture described
+above. Each mode ingested exactly 12,000 measured events, completed 60 distinct
+asynchronous insights and returned 15 captured replays. Stored replay blobs
+from both final capture phases were also retrieved and checked for their
+captured content. No measured request, task or native-progress failures occurred.
+
+| Metric | Beat, eight children | Go, one child |
+| --- | ---: | ---: |
+| Worker-container Python processes | 10 | 2 |
+| Worker-container total processes | 12 | 5 |
+| Worker-container PSS, MiB | 6,051 | 1,230 |
+| Worker-container working set, MiB | 6,030 | 1,188 |
+| Worker-container swap, MiB | 0 | 0 |
+| Scheduler RSS, MiB | 1,185 | 15.0 |
+| Whole-stack working set, MiB | 9,927 | 5,127 |
+| Whole-stack working set plus swap, MiB | 13,184 | 8,366 |
+| Insight pickup time, median / p95 / max, ms | 49 / 62 / 65 | 49 / 68 / 308 |
+
+Memory values are medians of five run medians, using the same cgroup and
+per-process sampling method as the scheduler comparison. Each run waits for
+the Python consumers and scheduler before a 30-second warmup and 60-second
+measurement. Worker PSS run medians ranged from 6,049–6,057 MiB before and
+1,224–1,251 MiB after. Other containers held about 3.2 GiB in swap in both
+modes, which is why the whole-stack swap-inclusive figure is included.
+
+The measured worker PSS reduction is 4,821 MiB. This combines retirement of
+beat with an explicit concurrency change; native housekeeping does not
+automatically remove consumers. Python received 370 tasks in the baseline
+windows and 178 in the final windows. The latter contained none of the six
+replaced housekeeping task streams. The baseline included 149 progress polls,
+31 heartbeats, 31 queue probes, 16 progress watchdogs and two cache-hit jobs.
+Returning to baseline between runs restarted the Python poll chain.
+Business cron counts vary with the wall-clock phase; task totals are not a
+throughput comparison.
+
+One child is the smallest positive concurrency and handled this fixture; it
+is not a capacity recommendation for larger projects, long exports or cohort
+jobs. Those still execute in Python and need their own sizing. API workers
+remain at three. Neither concurrency reduction nor API changes are enabled by
+default, and these short synthetic windows do not replace a longer soak.
 
 ## Standalone Redis maintenance
 
