@@ -25,8 +25,8 @@ Remove any existing `GRANIAN_WORKERS` override to use the single-process default
 ASGI request threads; it is not needed for this profile. Each concurrent
 request can hold its own database connection until request completion.
 
-Set `POSTHOG_LOW_MEMORY_WEB=1` only on web. Worker consumer concurrency remains
-independently controlled by `WEB_CONCURRENCY`. To roll back, unset
+Set `POSTHOG_LOW_MEMORY_WEB=1` only on web. Use the isolated worker profile below
+for Celery. To roll back web, unset
 `POSTHOG_LOW_MEMORY_WEB`, restore the previous `GRANIAN_*` overrides and restart
 web. For example, restore `GRANIAN_WORKERS=3` if that was the previous web
 configuration. Rolling back web does not change worker scheduling or Redis
@@ -161,6 +161,107 @@ timestamp prevents an overlapping old chain. To restore beat too, unset
 concurrency separately with the existing `WEB_CONCURRENCY` setting; neither
 switch changes the upstream concurrency default.
 
+### Isolated low-memory workers
+
+Set `POSTHOG_LOW_MEMORY_WORKER=1` on the worker to reserve a prefork consumer
+for `analytics_queries`, which executes asynchronous foreground insights and
+queries. A second worker consumes all remaining queues from
+`bin/celery-queues.env`. The defaults are one query child, three background children
+and prefetch of one. `WEB_CONCURRENCY` controls the background children;
+`CELERY_QUERY_CONCURRENCY` controls the query children. Both and
+`CELERY_WORKER_PREFETCH_MULTIPLIER` remain explicit overrides.
+This profile defaults off and works with either scheduler.
+
+Use this worker configuration with the threaded web profile:
+
+```text
+POSTHOG_LOW_MEMORY_WORKER=1
+POSTHOG_GO_SCHEDULER=1
+POSTHOG_GO_HOUSEKEEPING=1
+WEB_CONCURRENCY=3
+CELERY_QUERY_CONCURRENCY=1
+CELERY_WORKER_PREFETCH_MULTIPLIER=1
+```
+
+Long-running periodic tasks, including the daily MCP registry sync and cohort
+calculations, cannot reserve the foreground consumer. `analytics_limited` stays
+on the background worker because it runs query analysis and precomputation,
+not foreground insight execution. New queues in the default queue list stay
+on the background worker. If `CELERY_WORKER_QUEUES` is explicitly set, it must
+include `analytics_queries` and at least one background queue.
+
+Three background children leave capacity for short periodic tasks during a
+long-running task and a burst of cohort calculations.
+A single background child protected insights in a mixed-load pilot,
+but nine periodic attempts expired in its queues within three minutes. An
+expired attempt cannot later execute, even if its queue eventually drains.
+With two background children, a feature-flag rebuild attempt arrived after
+63.5 seconds, beyond its 60-second expiry. Three is the smallest background
+pool that passed the full mixed-load validation below.
+
+Separate worker names prevent control-command collisions. Each worker has its
+own Prometheus multiprocess directory. Scrape both worker metrics endpoints:
+the background worker uses `CELERY_METRICS_PORT` (default `8001`), and the query
+worker uses `CELERY_QUERY_METRICS_PORT` (default `8002`). The launcher forwards
+termination to both workers and the scheduler and waits for them to drain.
+Allow enough container shutdown grace time for in-flight tasks.
+
+The extra main process costs memory, but preserves prefork task time limits
+and child recycling. A solo or threaded pool does not provide those same
+controls. Increasing a shared pool to two children or adjusting queue priority
+cannot reserve query capacity when multiple heavy jobs run at once. Isolation
+does not protect against foreground-query saturation or shared database, CPU
+or memory exhaustion. Size background capacity separately if its jobs accumulate.
+
+To roll back isolation, unset `POSTHOG_LOW_MEMORY_WORKER`, restore the previous
+`WEB_CONCURRENCY` and prefetch settings, and restart the worker. To restore the
+tested baseline, use eight children and Python beat by also unsetting
+`POSTHOG_GO_SCHEDULER` and `POSTHOG_GO_HOUSEKEEPING`. Queue routing and Redis state
+do not change; do not clear the broker. Returning to one shared child restores
+the starvation risk.
+
+#### Retention-sized validation
+
+Both baseline and fixed profiles ran the same mixed load for 1,200 seconds on
+50 million retention events plus one million export events, 100,000 persons,
+300,000 replay metadata sessions and 100 dynamic cohorts. Each window explicitly
+ran the real MCP registry sync and recalculated all 100 cohorts. All 101 forced
+tasks succeeded. The fixed MCP task ran for 531 seconds while 108 foreground
+queries completed. No task was disabled or terminated during either passing window.
+
+| Metric | Previous shared child | Baseline rerun | Isolated profile |
+| --- | ---: | ---: | ---: |
+| Stack working set plus swap, GiB | 7.98 | 14.56 | 10.30 |
+| Worker PSS, MiB | 1,777.6 | 6,514.4 | 4,293.8 |
+| User queue wait p50 / p95 / max, ms, observed starts | 6.1 / 353.3 / 1,152.5 | 5.0 / 6.9 / 11.7 | 5.8 / 429.7 / 1,184.5 |
+| Completed / planned insights | 210 / 240 | 240 / 240 | 240 / 240 |
+| Insight deadline misses | 6 | 0 | 0 |
+| Due attempts left unstarted | 101 | 0 | 0 |
+| HTTP / task / query failures | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+The previous shared-child wait figures exclude six insights that never started;
+the oldest had waited at least 243.9 seconds. Its overall maximum is not the
+observed-start maximum in the table. Both new runs persisted 25,600 events and
+139 replays, with stored replay blobs checked. Foreground execution stayed
+exclusively on the query worker. The cohort code canceled 104 future fallback
+statistics timers before their ETA in the isolated run; no due task was revoked.
+
+Memory is the median of 38 samples after discarding the first minute from 40
+samples at 30-second cadence. Working set excludes inactive file cache; the
+main footprint includes swap. PSS avoids counting shared prefork pages twice.
+The worker grows from two Python processes in the previous shared-child setup
+to six: two masters and four children. Its working set plus swap rises from
+1,776.7 to 4,259.1 MiB. Whole-stack footprint rises by 2.32 GiB and remains
+4.26 GiB below the baseline rerun. Cache, swap residency and registry state
+also vary between these sequential windows, so the differences are not a
+precise attribution to the extra consumers alone.
+
+This validates the tested one-day query shapes and arrival rate at this data
+size. It does not establish capacity for arbitrary query complexity or any
+number of simultaneous background jobs. The isolated pool prevents background
+tasks from occupying foreground consumers; shared resource exhaustion can still
+affect both pools.
+
 ### Housekeeping contract tests
 
 Use isolated Redis (database 15 is used by the contract producer) and PostgreSQL
@@ -230,12 +331,12 @@ jobs. Those still execute in Python and need their own sizing. API workers
 remain at three. Neither concurrency reduction nor API changes are enabled by
 default, and these short synthetic windows do not replace a longer soak.
 
-With `WEB_CONCURRENCY=1`, any long-running Celery task can block asynchronous
+With a shared `WEB_CONCURRENCY=1` consumer, any long-running Celery task can block asynchronous
 insights across queues until it finishes. A retention-sized test reproduced
 this with the daily MCP registry sync: the scheduler published it once to
 `long_running`, but the only consumer could not execute queued insights while
 it ran. Keep enough Python consumer capacity or isolate long-running queues
-in dedicated workers, and validate that configuration separately. Go scheduling
+in dedicated workers using `POSTHOG_LOW_MEMORY_WORKER=1`. Go scheduling
 and housekeeping do not provide isolation between Python task queues.
 
 ## Standalone Redis maintenance

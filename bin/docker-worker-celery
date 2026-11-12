@@ -10,6 +10,7 @@ help () {
   echo "  --help, -h            show this brief help"
   echo "  --with-scheduler      start RedBeat, the Celery scheduler (deprecates --with-beat)"
   echo "  --concurrency=<N>     start N workers (overrides env var WEB_CONCURRENCY)"
+  echo "  POSTHOG_LOW_MEMORY_WORKER=1 reserves a separate consumer for insights"
   echo
   echo "Advanced Celery options (disabled by default):"
   echo "  --with-heartbeat      start Celery internal heartbeat (normally not useful)"
@@ -60,16 +61,21 @@ done
 # Celery tasks before they can drain, even though K8s gives us 1230s of
 # grace time via terminationGracePeriodSeconds.
 cleanup() {
-  kill $(jobs -p) 2>/dev/null
-  wait
+  kill $(jobs -p) 2>/dev/null || true
+  wait || true
+  if [[ -n "${query_metrics_dir:-}" ]]; then
+    rm -rf "$query_metrics_dir"
+  fi
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 # Prometheus multiprocess mode: each prefork child writes metrics to this
 # shared directory; the HTTP endpoint aggregates across all children.
 # Without this, only one child (the one that binds port 8001) is scraped,
 # causing Prometheus to see ~1/N of actual task events.
-export PROMETHEUS_MULTIPROC_DIR="/tmp/posthog_celery_prometheus"
+export PROMETHEUS_MULTIPROC_DIR="${PROMETHEUS_MULTIPROC_DIR:-${TMPDIR:-/tmp}/posthog_celery_prometheus}"
 
 if [ "$with_scheduler" == "true" ]; then
   ./bin/docker-worker-beat &
@@ -77,20 +83,24 @@ fi
 
 FLAGS=()
 FLAGS+=("-Ofair")
-FLAGS+=("-n node@%h")
 [ "$with_gossip" == "false" ]    && FLAGS+=("--without-gossip")
 [ "$with_mingle" == "false" ]    && FLAGS+=("--without-mingle")
 [ "$with_heartbeat" == "false" ] && FLAGS+=("--without-heartbeat")
 
 # On Heroku $WEB_CONCURRENCY contains suggested number of forks per dyno type
 # https://github.com/heroku/heroku-buildpack-python/blob/main/vendor/WEB_CONCURRENCY.sh
-[[ -n "${WEB_CONCURRENCY}" ]]    && FLAGS+=" --concurrency $WEB_CONCURRENCY"
+if [[ "${POSTHOG_LOW_MEMORY_WORKER:-0}" = "1" ]]; then
+  WEB_CONCURRENCY=${WEB_CONCURRENCY:-3}
+  CELERY_WORKER_PREFETCH_MULTIPLIER=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
+fi
+CONCURRENCY=()
+[[ -n "${WEB_CONCURRENCY}" ]]    && CONCURRENCY+=(--concurrency "$WEB_CONCURRENCY")
 # Restart worker process after it processes this many tasks (to mitigate memory leaks)
-[[ -n "${CELERY_MAX_TASKS_PER_CHILD}" ]]    && FLAGS+=" --max-tasks-per-child $CELERY_MAX_TASKS_PER_CHILD"
+[[ -n "${CELERY_MAX_TASKS_PER_CHILD}" ]]    && FLAGS+=(--max-tasks-per-child "$CELERY_MAX_TASKS_PER_CHILD")
 # Restart worker process after it exceeds this much memory usage (to mitigate memory leaks)
-[[ -n "${CELERY_MAX_MEMORY_PER_CHILD}" ]]    && FLAGS+=" --max-memory-per-child $CELERY_MAX_MEMORY_PER_CHILD"
+[[ -n "${CELERY_MAX_MEMORY_PER_CHILD}" ]]    && FLAGS+=(--max-memory-per-child "$CELERY_MAX_MEMORY_PER_CHILD")
 
-[[ -n "${CELERY_WORKER_PREFETCH_MULTIPLIER}" ]] && FLAGS+=" --prefetch-multiplier $CELERY_WORKER_PREFETCH_MULTIPLIER"
+[[ -n "${CELERY_WORKER_PREFETCH_MULTIPLIER}" ]] && FLAGS+=(--prefetch-multiplier "$CELERY_WORKER_PREFETCH_MULTIPLIER")
 
 if [[ -z "${CELERY_WORKER_QUEUES}" ]]; then
   source ./bin/celery-queues.env
@@ -102,7 +112,34 @@ echo
 
 ./bin/migrate-check
 
-SKIP_ASYNC_MIGRATIONS_SETUP=0 CELERY_WORKER_QUEUES=$CELERY_WORKER_QUEUES celery -A posthog worker ${FLAGS[*]} &
+if [[ "${POSTHOG_LOW_MEMORY_WORKER:-0}" = "1" ]]; then
+  background_queues=()
+  query_queue=
+  IFS=',' read -ra queues <<< "$CELERY_WORKER_QUEUES"
+  for queue in "${queues[@]}"; do
+    if [[ "$queue" = "analytics_queries" ]]; then
+      query_queue=$queue
+    else
+      background_queues+=("$queue")
+    fi
+  done
+  if [[ -z "$query_queue" || ${#background_queues[@]} -eq 0 ]]; then
+    echo "Low-memory workers require analytics_queries and at least one background queue" >&2
+    exit 1
+  fi
+  background_queues=$(IFS=','; echo "${background_queues[*]}")
+  # Each main process cleans its metrics directory at startup, so they cannot share one.
+  query_metrics_dir=$(mktemp -d)
+  mkdir -p "$query_metrics_dir/queries"
+  SKIP_ASYNC_MIGRATIONS_SETUP=0 CELERY_WORKER_QUEUES=$query_queue \
+    PROMETHEUS_MULTIPROC_DIR="$query_metrics_dir/queries" CELERY_METRICS_PORT="${CELERY_QUERY_METRICS_PORT:-8002}" \
+    celery -A posthog worker "${FLAGS[@]}" --concurrency "${CELERY_QUERY_CONCURRENCY:-1}" -n queries@%h --queues "$query_queue" &
+  SKIP_ASYNC_MIGRATIONS_SETUP=0 CELERY_WORKER_QUEUES=$background_queues \
+    celery -A posthog worker "${FLAGS[@]}" "${CONCURRENCY[@]}" -n background@%h --queues "$background_queues" &
+else
+  SKIP_ASYNC_MIGRATIONS_SETUP=0 CELERY_WORKER_QUEUES=$CELERY_WORKER_QUEUES \
+    celery -A posthog worker "${FLAGS[@]}" "${CONCURRENCY[@]}" -n node@%h &
+fi
 
 # Exit if any processes exit, and exit with it's exit code
 wait -n
