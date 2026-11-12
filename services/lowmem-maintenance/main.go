@@ -93,6 +93,14 @@ func run() error {
 	opts.ContextTimeoutEnabled = true
 	client := redis.NewClient(opts)
 	defer client.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if len(os.Args) == 3 && os.Args[1] == "--schedule" {
+		return runScheduler(ctx, client, os.Args[2])
+	}
+	if len(os.Args) != 1 {
+		return errors.New("usage: maintenance [--schedule file]")
+	}
 	data, err := os.ReadFile("queues.json")
 	if err != nil {
 		return errors.New("cannot read queues.json")
@@ -120,8 +128,6 @@ func run() error {
 	transport.Proxy = nil
 	defer transport.CloseIdleConnections()
 	m := maintenance{client, queues, gateway, &http.Client{Transport: transport, Timeout: 3 * time.Second}}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	var wg sync.WaitGroup
 	for name, task := range map[string]func(context.Context) error{"heartbeat": m.heartbeat, "queue depth": m.queueDepth} {
 		wg.Add(1)

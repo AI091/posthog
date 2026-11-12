@@ -1,0 +1,12 @@
+FROM golang:1.24-bookworm AS build
+WORKDIR /src
+COPY services/lowmem-maintenance/go.mod services/lowmem-maintenance/go.sum ./
+RUN go mod download
+COPY services/lowmem-maintenance/*.go ./
+RUN CGO_ENABLED=0 go build -trimpath -o /scheduler .
+
+FROM posthog/posthog@sha256:d75cb0849cb950868151b2541f08c6a0fdca89d2f26c5435d7ed9b5257520fed
+COPY --from=build /scheduler /usr/local/bin/posthog-go-maintenance
+COPY services/lowmem-maintenance/export_schedule.py /code/services/lowmem-maintenance/export_schedule.py
+COPY bin/docker-worker-beat /code/bin/docker-worker-beat
+COPY posthog/tasks/scheduled.py /code/posthog/tasks/scheduled.py

@@ -1,5 +1,29 @@
 #!/bin/bash
 set -e
 
+if [ "${POSTHOG_GO_SCHEDULER:-0}" = "1" ]; then
+    if [ "${POSTHOG_GO_MAINTENANCE:-0}" = "1" ]; then
+        echo "Unset POSTHOG_GO_MAINTENANCE before enabling the Go scheduler" >&2
+        exit 1
+    fi
+    schedule_file=$(mktemp)
+    scheduler_pid=
+    cleanup() {
+        if [ -n "${scheduler_pid:-}" ]; then
+            kill "$scheduler_pid" 2>/dev/null || true
+            wait "$scheduler_pid" 2>/dev/null || true
+        fi
+        rm -f "$schedule_file"
+    }
+    trap cleanup EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    python -m services.lowmem-maintenance.export_schedule "$schedule_file"
+    "${POSTHOG_GO_SCHEDULER_BINARY:-/usr/local/bin/posthog-go-maintenance}" --schedule "$schedule_file" &
+    scheduler_pid=$!
+    wait "$scheduler_pid"
+    exit $?
+fi
+
 rm celerybeat.pid || echo "celerybeat.pid not found, proceeding"
 celery -A posthog beat -S redbeat.RedBeatScheduler
