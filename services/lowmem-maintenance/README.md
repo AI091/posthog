@@ -230,6 +230,14 @@ jobs. Those still execute in Python and need their own sizing. API workers
 remain at three. Neither concurrency reduction nor API changes are enabled by
 default, and these short synthetic windows do not replace a longer soak.
 
+With `WEB_CONCURRENCY=1`, any long-running Celery task can block asynchronous
+insights across queues until it finishes. A retention-sized test reproduced
+this with the daily MCP registry sync: the scheduler published it once to
+`long_running`, but the only consumer could not execute queued insights while
+it ran. Keep enough Python consumer capacity or isolate long-running queues
+in dedicated workers, and validate that configuration separately. Go scheduling
+and housekeeping do not provide isolation between Python task queues.
+
 ## Standalone Redis maintenance
 
 This opt-in Go process replaces `posthog.tasks.tasks.redis_heartbeat` and
