@@ -1,5 +1,34 @@
 # Redis maintenance service
 
+## Threaded web profile (experimental)
+
+`POSTHOG_LOW_MEMORY_WEB=1` selects a single Granian application process in
+`bin/docker-server`, with eight concurrent requests per process. It defaults
+off. The profile uses ASGI: Django's request-scoped thread contexts let sync
+views overlap while retaining async streaming responses. A blanket WSGI switch
+would buffer async response iterators before returning their contents.
+Authentication, permissions, middleware, serializers and query execution stay
+in Django. No metadata endpoint is implemented in Go.
+
+Build `Dockerfile.scheduler` as described below and use that image for web as
+well as worker, retaining each service's normal command. The image includes
+both default-off switches. Pass the desired environment variables into the
+containers explicitly, for example in a Compose environment override.
+
+The profile sets `GRANIAN_INTERFACE=asgi`, defaults `GRANIAN_WORKERS` to `1`
+and defaults `GRANIAN_BACKPRESSURE` to `8`. Explicit worker and backpressure
+values take precedence. Remove any existing `GRANIAN_WORKERS` override to use
+the single-process default. `GRANIAN_BLOCKING_THREADS` controls WSGI, not the
+ASGI request threads; it is not needed for this profile. Each concurrent
+request can hold its own database connection until request completion.
+
+Set `POSTHOG_LOW_MEMORY_WEB=1` only on web. Worker consumer concurrency remains
+independently controlled by `WEB_CONCURRENCY`. To roll back, unset
+`POSTHOG_LOW_MEMORY_WEB`, restore the previous `GRANIAN_*` overrides and restart
+web. For example, restore `GRANIAN_WORKERS=3` if that was the previous web
+configuration. Rolling back web does not change worker scheduling or Redis
+state. To roll back the worker too, follow the housekeeping rollback below.
+
 ## Complete scheduler (experimental)
 
 `POSTHOG_GO_SCHEDULER=1` selects the Go scheduler in `bin/docker-worker-beat`.

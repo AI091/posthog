@@ -13,12 +13,19 @@ export STATSD_PORT=${STATSD_PORT:-8125}
 # The granian CLI reads every GRANIAN_* var natively, so these only set the
 # defaults that differ from granian's own.
 
+if [ "${POSTHOG_LOW_MEMORY_WEB:-0}" = "1" ]; then
+    # Django's ASGI handler gives each request its own thread context. Keep ASGI
+    # so async streaming responses still stream instead of buffering under WSGI.
+    export GRANIAN_INTERFACE=asgi
+    export GRANIAN_WORKERS=${GRANIAN_WORKERS:-1}
+    export GRANIAN_BACKPRESSURE=${GRANIAN_BACKPRESSURE:-8}
+fi
+
 # asgi serves posthog.asgi:application, wsgi serves posthog.wsgi:application
 export GRANIAN_INTERFACE=${GRANIAN_INTERFACE:-asgi}
 export GRANIAN_HOST=${GRANIAN_HOST:-0.0.0.0}
-# Under ASGI a sync view holds its worker for the whole request
-# (thread_sensitive=True), so concurrency comes only from adding workers. Under
-# WSGI it comes from the blocking thread pool, steered by
+# Django's ASGI request contexts isolate sync work in request-scoped threads.
+# Under WSGI concurrency comes from the blocking thread pool, steered by
 # GRANIAN_BACKPRESSURE/GRANIAN_BLOCKING_THREADS.
 export GRANIAN_WORKERS=${GRANIAN_WORKERS:-4}
 export GRANIAN_LOG_LEVEL=${GRANIAN_LOG_LEVEL:-warning}
